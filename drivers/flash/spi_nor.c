@@ -156,6 +156,10 @@ struct spi_nor_config {
 	bool hold_gpios_exist:1;
 	bool has_flsr: 1;
 	bool use_fast_read: 1;
+
+	/* SPI bus width for TX and RX operations */
+	uint8_t spi_tx_bus_width;
+	uint8_t spi_rx_bus_width;
 };
 
 /**
@@ -392,27 +396,18 @@ static int spi_nor_access(const struct device *const dev,
 	bool is_addressed = (access & NOR_ACCESS_ADDRESSED) != 0U;
 	bool is_write = (access & NOR_ACCESS_WRITE) != 0U;
 	bool has_dummy = (access & NOR_ACCESS_DUMMY_BYTE) != 0U;
-	uint8_t buf[6] = {opcode};
-	struct spi_buf spi_buf_tx[2] = {
-		{
-			.buf = buf,
-			.len = 1,
-		},
-		{
-			.buf = data,
-			.len = length
-		}
-	};
-	struct spi_buf spi_buf_rx[2] = {
-		{
-			.buf = NULL,
-			.len = 1,
-		},
-		{
-			.buf = data,
-			.len = length
-		}
-	};
+	bool is_extended_spi = (driver_cfg->spi_tx_bus_width > 1) ||
+		(driver_cfg->spi_rx_bus_width > 1);
+	uint8_t ncycles = 8; /* Default dummy cycles for fast read commands */
+
+	uint8_t buf[6] = { 0 };
+	buf[0] = opcode;
+	size_t cmd_len = 1;
+
+	struct spi_buf spi_buf_tx[2];
+	struct spi_buf spi_buf_rx[2];
+	size_t tx_count = 0;
+	size_t rx_count = 0;
 
 	if (is_addressed) {
 		bool access_24bit = (access & NOR_ACCESS_24BIT_ADDR) != 0;
@@ -429,27 +424,64 @@ static int spi_nor_access(const struct device *const dev,
 
 		if (use_32bit) {
 			memcpy(&buf[1], &addr32.u8[0], 4);
-			spi_buf_tx[0].len += 4;
-			spi_buf_rx[0].len += 4;
+			cmd_len += 4;
 		} else {
 			memcpy(&buf[1], &addr32.u8[1], 3);
-			spi_buf_tx[0].len += 3;
-			spi_buf_rx[0].len += 3;
+			cmd_len += 3;
 		}
 	};
+
 	if (has_dummy) {
-		spi_buf_tx[0].len++;
-		spi_buf_rx[0].len++;
+		if (!is_extended_spi) {
+			cmd_len += 1;
+		}
+	}
+
+	spi_buf_tx[tx_count++] = (struct spi_buf){
+		.buf = buf,
+		.len = cmd_len,
+		.bus_width = BUS_WIDTH_SPI,
+	};
+
+	if (!is_extended_spi) {
+		spi_buf_rx[rx_count++] = (struct spi_buf){
+			.buf = NULL,
+			.len = cmd_len,
+			.bus_width = BUS_WIDTH_SPI,
+		};
+	}
+
+	if (length > 0) {
+		if (is_write) {
+			spi_buf_tx[tx_count++] = (struct spi_buf){
+				.buf = data,
+				.len = length,
+				.bus_width = is_extended_spi ? driver_cfg->spi_tx_bus_width : BUS_WIDTH_SPI,
+			};
+		} else {
+			if (has_dummy && is_extended_spi) {
+				spi_buf_tx[tx_count++] = (struct spi_buf){
+					.buf = &ncycles,
+					.len = 1,
+					.bus_width = driver_cfg->spi_rx_bus_width,
+				};
+			}
+			spi_buf_rx[rx_count++] = (struct spi_buf){
+				.buf = data,
+				.len = length,
+				.bus_width = is_extended_spi ? driver_cfg->spi_rx_bus_width : BUS_WIDTH_SPI,
+			};
+		}
 	}
 
 	const struct spi_buf_set tx_set = {
 		.buffers = spi_buf_tx,
-		.count = (is_write && length != 0) ? 2 : 1,
+		.count = tx_count,
 	};
 
 	const struct spi_buf_set rx_set = {
 		.buffers = spi_buf_rx,
-		.count = 2,
+		.count = rx_count,
 	};
 
 	if (is_write) {
@@ -881,16 +913,26 @@ static int spi_nor_read(const struct device *dev, off_t addr, void *dest,
 	if (IS_ENABLED(ANY_INST_USE_4B_ADDR_OPCODES) && cfg->use_4b_addr_opcodes) {
 		if (addr > SPI_NOR_3B_ADDR_MAX) {
 			if (IS_ENABLED(ANY_INST_USE_FAST_READ) && cfg->use_fast_read) {
-				ret = spi_nor_cmd_addr_fast_read_4b(dev, SPI_NOR_CMD_READ_FAST_4B,
+				if (cfg->spi_rx_bus_width == BUS_WIDTH_QUAD) {
+					ret = spi_nor_cmd_addr_fast_read_4b(dev, SPI_NOR_CMD_QREAD_4B,
 								    addr, dest, size);
+				} else {
+					ret = spi_nor_cmd_addr_fast_read_4b(dev, SPI_NOR_CMD_READ_FAST_4B,
+								    addr, dest, size);
+				}
 			} else {
 				ret = spi_nor_cmd_addr_read_4b(dev, SPI_NOR_CMD_READ_4B, addr, dest,
 							       size);
 			}
 		} else {
 			if (IS_ENABLED(ANY_INST_USE_FAST_READ) && cfg->use_fast_read) {
-				ret = spi_nor_cmd_addr_fast_read_3b(dev, SPI_NOR_CMD_READ_FAST,
+				if (cfg->spi_rx_bus_width == BUS_WIDTH_QUAD) {
+					ret = spi_nor_cmd_addr_fast_read_3b(dev, SPI_NOR_CMD_QREAD,
 								    addr, dest, size);
+				} else {
+					ret = spi_nor_cmd_addr_fast_read_3b(dev, SPI_NOR_CMD_READ_FAST,
+								    addr, dest, size);
+				}
 			} else {
 				ret = spi_nor_cmd_addr_read_3b(dev, SPI_NOR_CMD_READ, addr, dest,
 							       size);
@@ -898,8 +940,13 @@ static int spi_nor_read(const struct device *dev, off_t addr, void *dest,
 		}
 	} else {
 		if (IS_ENABLED(ANY_INST_USE_FAST_READ) && cfg->use_fast_read) {
-			ret = spi_nor_cmd_addr_fast_read(dev, SPI_NOR_CMD_READ_FAST, addr, dest,
+			if (cfg->spi_rx_bus_width == BUS_WIDTH_QUAD) {
+				ret = spi_nor_cmd_addr_fast_read(dev, SPI_NOR_CMD_QREAD,
+								addr, dest, size);
+			} else {
+				ret = spi_nor_cmd_addr_fast_read(dev, SPI_NOR_CMD_READ_FAST, addr, dest,
 							 size);
+			}
 		} else {
 			ret = spi_nor_cmd_addr_read(dev, SPI_NOR_CMD_READ, addr, dest, size);
 		}
@@ -949,6 +996,7 @@ static int spi_nor_write(const struct device *dev, off_t addr,
 			 const void *src,
 			 size_t size)
 {
+	const struct spi_nor_config *cfg = dev->config;
 	const size_t flash_size = dev_flash_size(dev);
 	const uint16_t page_size = dev_page_size(dev);
 	int ret;
@@ -989,15 +1037,30 @@ static int spi_nor_write(const struct device *dev, off_t addr,
 			if (IS_ENABLED(ANY_INST_USE_4B_ADDR_OPCODES) &&
 			    DEV_CFG(dev)->use_4b_addr_opcodes) {
 				if (addr > SPI_NOR_3B_ADDR_MAX) {
-					ret = spi_nor_cmd_addr_write_4b(dev, SPI_NOR_CMD_PP_4B,
+					if (cfg->spi_tx_bus_width == BUS_WIDTH_QUAD) {
+						ret = spi_nor_cmd_addr_write_4b(dev, SPI_NOR_CMD_PP_1_1_4_4B,
 									addr, src, to_write);
+					} else {
+						ret = spi_nor_cmd_addr_write_4b(dev, SPI_NOR_CMD_PP_4B,
+									addr, src, to_write);
+					}
 				} else {
-					ret = spi_nor_cmd_addr_write_3b(dev, SPI_NOR_CMD_PP, addr,
+					if (cfg->spi_tx_bus_width == BUS_WIDTH_QUAD) {
+						ret = spi_nor_cmd_addr_write_3b(dev, SPI_NOR_CMD_PP_1_1_4,
+									addr, src, to_write);
+					} else {
+						ret = spi_nor_cmd_addr_write_3b(dev, SPI_NOR_CMD_PP, addr,
 									src, to_write);
+					}
 				}
 			} else {
-				ret = spi_nor_cmd_addr_write(dev, SPI_NOR_CMD_PP, addr, src,
+				if (cfg->spi_tx_bus_width == BUS_WIDTH_QUAD) {
+					ret = spi_nor_cmd_addr_write(dev, SPI_NOR_CMD_PP_1_1_4, addr,
+							src, to_write);
+				} else {
+					ret = spi_nor_cmd_addr_write(dev, SPI_NOR_CMD_PP, addr, src,
 							     to_write);
+				}
 			}
 
 			if (ret != 0) {
@@ -1897,6 +1960,8 @@ static DEVICE_API(flash, spi_nor_api) = {
 		.use_4b_addr_opcodes = DT_INST_PROP(idx, use_4b_addr_opcodes),			\
 		.has_flsr = DT_INST_PROP(idx, use_flag_status_register),			\
 		.use_fast_read = DT_INST_PROP(idx, use_fast_read),				\
+		.spi_tx_bus_width = DT_INST_PROP_OR(idx, spi_tx_bus_width, 1),			\
+		.spi_rx_bus_width = DT_INST_PROP_OR(idx, spi_rx_bus_width, 1),			\
 		IF_ENABLED(INST_HAS_LOCK(idx), (.has_lock = DT_INST_PROP(idx, has_lock),))	\
 		IF_ENABLED(ANY_INST_HAS_DPD, (INIT_T_ENTER_DPD(idx),))				\
 		IF_ENABLED(UTIL_AND(ANY_INST_HAS_DPD, ANY_INST_HAS_T_EXIT_DPD),			\
